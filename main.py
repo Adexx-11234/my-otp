@@ -38,10 +38,7 @@ bot_stats = {
     'is_running': False
 }
 
-# Store user sessions: {user_id: {'country': ..., 'number': ...}}
 user_sessions = {}
-
-# Track sent OTPs to avoid duplicates
 sent_otps = set()
 
 bot = None
@@ -90,7 +87,7 @@ def ivasms_login():
             return True
 
         logger.warning("⚠️ IVASMS login may have failed")
-        ivasms_logged_in = True  # Try anyway
+        ivasms_logged_in = True
         return True
 
     except Exception as e:
@@ -99,7 +96,6 @@ def ivasms_login():
 
 
 def get_ivasms_numbers():
-    """Get list of numbers from IVASMS"""
     global ivasms_session, ivasms_logged_in
     try:
         if not ivasms_logged_in:
@@ -110,7 +106,6 @@ def get_ivasms_numbers():
         soup = BeautifulSoup(resp.content, 'html.parser')
 
         numbers = []
-        # Try to find numbers in tables
         tables = soup.find_all('table')
         for table in tables:
             rows = table.find_all('tr')[1:]
@@ -127,7 +122,6 @@ def get_ivasms_numbers():
 
 
 def get_received_sms():
-    """Fetch received SMS from IVASMS"""
     global ivasms_session, ivasms_logged_in
     try:
         if not ivasms_logged_in:
@@ -166,7 +160,6 @@ def get_received_sms():
                     otp_match = re.search(r'\b(\d{4,8})\b', message)
                     if otp_match:
                         otp = otp_match.group(1)
-                        # Detect service from message
                         for svc in ['WhatsApp', 'Facebook', 'Instagram', 'Twitter', 'Telegram', 'Google', 'TikTok', 'Discord']:
                             if svc.lower() in message.lower():
                                 service = svc
@@ -186,7 +179,6 @@ def get_received_sms():
                                 'country': detect_country(phone)
                             })
 
-        # Also try live SMS endpoint
         try:
             live_url = "https://www.ivasms.com/portal/live/my_sms"
             live_resp = ivasms_session.get(live_url, timeout=15)
@@ -235,21 +227,51 @@ def get_received_sms():
         return []
 
 
+def detect_country(phone):
+    """Get country from IVASMS numbers list by matching phone number"""
+    try:
+        numbers = get_ivasms_numbers()
+        for row in numbers:
+            if len(row) >= 2:
+                number = row[0]
+                range_name = row[1]  # e.g "BENIN 761"
+                if phone and number and phone.replace('+', '').replace(' ', '') in number.replace('+', '').replace(' ', ''):
+                    # Extract just the country name from range name (remove the number at end)
+                    country_name = ' '.join(range_name.split()[:-1])  # "BENIN 761" → "BENIN"
+                    return country_name.title()  # "Benin"
+    except:
+        pass
+    return '🌍 Unknown'
+
+
+# ============================================================
+# KEYBOARDS
+# ============================================================
+
+def main_menu_keyboard():
+    keyboard = [
+        [InlineKeyboardButton("📱 Get Number", callback_data="get_number")],
+        [InlineKeyboardButton("📊 Status", callback_data="status"),
+         InlineKeyboardButton("📈 Stats", callback_data="stats")],
+        [InlineKeyboardButton("🔍 Check OTPs Now", callback_data="check")],
+        [InlineKeyboardButton("🧪 Send Test OTP", callback_data="test")]
+    ]
+    return InlineKeyboardMarkup(keyboard)
+
+
 def country_keyboard():
     numbers = get_ivasms_numbers()
-    
-    # Extract unique range names (countries) from your numbers
     ranges = {}
     for row in numbers:
         if len(row) >= 2:
             number = row[0]
-            range_name = row[1]  # e.g "BENIN 761"
+            range_name = row[1]
             if range_name not in ranges:
                 ranges[range_name] = number
-    
+
     keyboard = []
     row = []
-    for range_name, number in list(ranges.items())[:20]:  # Max 20
+    for range_name, number in list(ranges.items())[:20]:
         row.append(InlineKeyboardButton(
             f"📱 {range_name}",
             callback_data=f"country_{range_name}"
@@ -259,9 +281,32 @@ def country_keyboard():
             row = []
     if row:
         keyboard.append(row)
-    
+
+    if not keyboard:
+        keyboard = [[InlineKeyboardButton("⚠️ No numbers found", callback_data="menu")]]
+
     keyboard.append([InlineKeyboardButton("🏠 Main Menu", callback_data="menu")])
     return InlineKeyboardMarkup(keyboard)
+
+
+def number_assigned_keyboard():
+    keyboard = [
+        [InlineKeyboardButton("🔄 Change Number", callback_data="change_number")],
+        [InlineKeyboardButton("🌍 Change Country", callback_data="change_country")],
+        [InlineKeyboardButton("🏠 Main Menu", callback_data="menu")]
+    ]
+    return InlineKeyboardMarkup(keyboard)
+
+
+def otp_buttons():
+    keyboard = [
+        [
+            InlineKeyboardButton("📢 NUMBER CHANNEL", url=CHANNEL_LINK),
+            InlineKeyboardButton("🤖 BOT DEVELOPER", url=DEV_LINK)
+        ]
+    ]
+    return InlineKeyboardMarkup(keyboard)
+
 
 # ============================================================
 # MESSAGE FORMATTERS
@@ -275,7 +320,6 @@ def format_otp_message(data):
     timestamp = data.get('timestamp', datetime.now().strftime('%Y-%m-%d %H:%M:%S'))
     message = data.get('message', '')
 
-    # Mask phone number
     if len(phone) > 6:
         masked = phone[:4] + '***' + phone[-4:]
     else:
@@ -297,60 +341,8 @@ def format_otp_message(data):
     return text
 
 
-def otp_buttons():
-    keyboard = [
-        [
-            InlineKeyboardButton("📢 NUMBER CHANNEL", url=CHANNEL_LINK),
-            InlineKeyboardButton("🤖 BOT DEVELOPER", url=DEV_LINK)
-        ]
-    ]
-    return InlineKeyboardMarkup(keyboard)
-
-
-def main_menu_keyboard():
-    keyboard = [
-        [InlineKeyboardButton("📱 Get Number", callback_data="get_number")],
-        [InlineKeyboardButton("📊 Status", callback_data="status"),
-         InlineKeyboardButton("📈 Stats", callback_data="stats")],
-        [InlineKeyboardButton("🔍 Check OTPs Now", callback_data="check")],
-        [InlineKeyboardButton("🧪 Send Test OTP", callback_data="test")]
-    ]
-    return InlineKeyboardMarkup(keyboard)
-
-
-def country_keyboard():
-    countries = [
-        ("🇺🇸 USA", "USA"), ("🇬🇧 UK", "UK"),
-        ("🇳🇬 Nigeria", "Nigeria"), ("🇻🇳 Vietnam", "Vietnam"),
-        ("🇮🇩 Indonesia", "Indonesia"), ("🇮🇳 India", "India"),
-        ("🇿🇼 Zimbabwe", "Zimbabwe"), ("🇮🇱 Israel", "Israel"),
-        ("🇻🇪 Venezuela", "Venezuela"), ("🇲🇾 Malaysia", "Malaysia"),
-        ("🇧🇩 Bangladesh", "Bangladesh"), ("🇵🇰 Pakistan", "Pakistan"),
-    ]
-    keyboard = []
-    row = []
-    for label, data in countries:
-        row.append(InlineKeyboardButton(label, callback_data=f"country_{data}"))
-        if len(row) == 2:
-            keyboard.append(row)
-            row = []
-    if row:
-        keyboard.append(row)
-    keyboard.append([InlineKeyboardButton("🏠 Main Menu", callback_data="menu")])
-    return InlineKeyboardMarkup(keyboard)
-
-
-def number_assigned_keyboard():
-    keyboard = [
-        [InlineKeyboardButton("🔄 Change Number", callback_data="change_number")],
-        [InlineKeyboardButton("🌍 Change Country", callback_data="change_country")],
-        [InlineKeyboardButton("🏠 Main Menu", callback_data="menu")]
-    ]
-    return InlineKeyboardMarkup(keyboard)
-
-
 # ============================================================
-# TELEGRAM COMMAND HANDLERS
+# TELEGRAM HANDLERS
 # ============================================================
 
 async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -415,11 +407,10 @@ Use this number to receive OTPs!""",
     elif data == "change_number":
         user_id_session = user_sessions.get(user_id, {})
         range_name = user_id_session.get('country', 'Unknown')
+        current_number = user_id_session.get('number')
 
         numbers = get_ivasms_numbers()
-        current_number = user_id_session.get('number')
         assigned_number = None
-
         for row in numbers:
             if len(row) >= 2 and row[1] == range_name and row[0] != current_number:
                 assigned_number = row[0]
@@ -508,7 +499,8 @@ Use this number to receive OTPs!""",
             parse_mode='HTML',
             reply_markup=main_menu_keyboard()
         )
-        
+
+
 # ============================================================
 # SEND OTP TO GROUP
 # ============================================================
@@ -624,23 +616,18 @@ def main():
         logger.error("❌ Missing environment variables!")
         return
 
-    # Login to IVASMS
     ivasms_login()
 
-    # Init Telegram bot
     bot = Bot(token=BOT_TOKEN)
     telegram_app = Application.builder().token(BOT_TOKEN).build()
 
-    # Add handlers
     telegram_app.add_handler(CommandHandler("start", start_command))
     telegram_app.add_handler(CallbackQueryHandler(button_handler))
 
     logger.info("✅ Bot initialized")
 
-    # Start polling
     start_telegram_bot()
 
-    # Send startup message
     def send_startup():
         time.sleep(3)
         try:
@@ -649,7 +636,7 @@ def main():
             async def send():
                 await bot.send_message(
                     chat_id=GROUP_ID,
-                    text="🚀 <b>OTP Bot Started!</b>\n\n✅ IVASMS connected\n✅ Monitoring every 60 seconds\n✅ Ready to forward OTPs",
+                    text="🚀 <b>OTP Bot Started!</b>\n\n✅ IVASMS connected\n✅ Monitoring every 10 seconds\n✅ Ready to forward OTPs",
                     parse_mode='HTML',
                     reply_markup=otp_buttons()
                 )
@@ -660,11 +647,9 @@ def main():
 
     threading.Thread(target=send_startup, daemon=True).start()
 
-    # Start background monitor
     monitor_thread = threading.Thread(target=background_monitor, daemon=True)
     monitor_thread.start()
 
-    # Start Flask
     port = int(os.environ.get('PORT', 5000))
     logger.info(f"Starting Flask on port {port}")
     app.run(host='0.0.0.0', port=port, debug=False)
