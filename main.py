@@ -240,16 +240,65 @@ def login_with_camoufox():
 
             # Go to login page
             logger.info("Navigating to IVASMS login...")
-            page.goto(LOGIN_URL, wait_until='networkidle', timeout=60000)
-            time.sleep(2)
+            page.goto(LOGIN_URL, wait_until='domcontentloaded', timeout=60000)
 
-            # Check if we got past Cloudflare
+            # Wait longer for Cloudflare to resolve
+            time.sleep(8)
+
+            # Check if Cloudflare challenge is present
+            cf_keywords = ['checking your browser', 'just a moment', 'cloudflare', 'ddos']
+            page_content = page.content().lower()
+            cf_detected = any(kw in page_content for kw in cf_keywords)
+            if cf_detected:
+                logger.info("☁️ Cloudflare challenge detected — waiting up to 30s...")
+                # Wait for challenge to pass (up to 30 seconds)
+                for _ in range(30):
+                    time.sleep(1)
+                    page_content = page.content().lower()
+                    if not any(kw in page_content for kw in cf_keywords):
+                        logger.info("✅ Cloudflare challenge passed!")
+                        break
+                else:
+                    logger.warning("⚠️ Cloudflare challenge may not have resolved")
+
+            # Check if already logged in
             if 'login' not in page.url and 'portal' in page.url:
                 logger.info("Already logged in!")
                 cookies = page.context.cookies()
                 save_cookies(cookies)
                 last_login_time = time.time()
                 return cookies
+
+            # Wait for the login form to actually appear in DOM
+            logger.info("Waiting for login form...")
+            try:
+                page.wait_for_selector('input[name="email"]', timeout=30000)
+            except Exception:
+                # Try alternate selectors
+                logger.warning("email input not found by name, trying type=email...")
+                try:
+                    page.wait_for_selector('input[type="email"]', timeout=15000)
+                    # Fill using type selector instead
+                    logger.info("Filling login form (via type selector)...")
+                    page.fill('input[type="email"]', IVASMS_EMAIL)
+                    time.sleep(0.5)
+                    page.fill('input[type="password"]', IVASMS_PASSWORD)
+                    time.sleep(0.5)
+                    page.click('button[type="submit"]')
+                    page.wait_for_load_state('networkidle', timeout=30000)
+                    time.sleep(2)
+                    cookies = page.context.cookies()
+                    save_cookies(cookies)
+                    last_login_time = time.time()
+                    logger.info(f"✅ Login done via fallback selector. URL: {page.url}")
+                    return cookies
+                except Exception as e2:
+                    logger.error(f"Fallback selector also failed: {e2}")
+                    # Save whatever cookies we have (may include CF clearance)
+                    cookies = page.context.cookies()
+                    if cookies:
+                        save_cookies(cookies)
+                    return cookies
 
             # Fill login form
             logger.info("Filling login form...")
@@ -266,24 +315,21 @@ def login_with_camoufox():
             current_url = page.url
             logger.info(f"After login URL: {current_url}")
 
+            cookies = page.context.cookies()
+            save_cookies(cookies)
+            last_login_time = time.time()
+
             if 'portal' in current_url or 'dashboard' in current_url:
-                cookies = page.context.cookies()
-                save_cookies(cookies)
-                last_login_time = time.time()
                 logger.info(f"✅ Camoufox login successful! Got {len(cookies)} cookies")
-                return cookies
             else:
                 logger.warning(f"Login may have failed, URL: {current_url}")
-                cookies = page.context.cookies()
-                save_cookies(cookies)
-                last_login_time = time.time()
-                return cookies
+
+            return cookies
 
     except Exception as e:
         logger.error(f"Camoufox login error: {e}")
         return []
-
-
+        
 # ============================================================
 # IVASMS SESSION SETUP
 # ============================================================
