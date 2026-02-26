@@ -15,6 +15,16 @@ from urllib.parse import unquote
 from telegram import Bot, Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import Application, CommandHandler, CallbackQueryHandler, ContextTypes
 import random
+
+load_dotenv()
+
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
+)
+logger = logging.getLogger(__name__)
+
+# Selenium — optional, loaded AFTER logger is ready
 HAS_SELENIUM = False
 try:
     import undetected_chromedriver as uc
@@ -25,14 +35,6 @@ try:
     logger.info("✅ Selenium/undetected-chromedriver available")
 except ImportError:
     logger.warning("⚠️ Selenium not available — will use requests only")
-
-load_dotenv()
-
-logging.basicConfig(
-    level=logging.INFO,
-    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
-)
-logger = logging.getLogger(__name__)
 
 app = Flask(__name__)
 
