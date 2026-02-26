@@ -235,82 +235,124 @@ def login_with_camoufox():
     global last_login_time
     logger.info("🦊 Starting Camoufox browser to bypass Cloudflare...")
     try:
-        with Camoufox(headless=True, os='windows') as browser:
-            page = browser.new_page()
+        with Camoufox(
+            headless=True,
+            os='windows',
+            # Mimic a real screen size
+            screen={'width': 1920, 'height': 1080},
+            # Enable WebGL and other features real browsers have
+            args=['--disable-blink-features=AutomationControlled'],
+        ) as browser:
+            context = browser.new_context(
+                viewport={'width': 1920, 'height': 1080},
+                locale='en-US',
+                timezone_id='America/New_York',
+            )
+            page = context.new_page()
 
-            # Go to login page
+            # Mask automation signals
+            page.add_init_script("""
+                Object.defineProperty(navigator, 'webdriver', { get: () => undefined });
+                Object.defineProperty(navigator, 'plugins', { get: () => [1, 2, 3, 4, 5] });
+                Object.defineProperty(navigator, 'languages', { get: () => ['en-US', 'en'] });
+                window.chrome = { runtime: {} };
+            """)
+
             logger.info("Navigating to IVASMS login...")
-            page.goto(LOGIN_URL, wait_until='domcontentloaded', timeout=60000)
+            page.goto(LOGIN_URL, wait_until='domcontentloaded', timeout=90000)
 
-            # Wait longer for Cloudflare to resolve
-            time.sleep(8)
+            # Initial wait for CF to start resolving
+            time.sleep(5)
 
-            # Check if Cloudflare challenge is present
-            cf_keywords = ['checking your browser', 'just a moment', 'cloudflare', 'ddos']
-            page_content = page.content().lower()
-            cf_detected = any(kw in page_content for kw in cf_keywords)
-            if cf_detected:
-                logger.info("☁️ Cloudflare challenge detected — waiting up to 30s...")
-                # Wait for challenge to pass (up to 30 seconds)
-                for _ in range(30):
-                    time.sleep(1)
-                    page_content = page.content().lower()
-                    if not any(kw in page_content for kw in cf_keywords):
-                        logger.info("✅ Cloudflare challenge passed!")
-                        break
-                else:
-                    logger.warning("⚠️ Cloudflare challenge may not have resolved")
+            cf_keywords = ['checking your browser', 'just a moment', 'cloudflare', 'ddos-guard', 'please wait']
 
-            # Check if already logged in
-            if 'login' not in page.url and 'portal' in page.url:
-                logger.info("Already logged in!")
-                cookies = page.context.cookies()
-                save_cookies(cookies)
-                last_login_time = time.time()
-                return cookies
-
-            # Wait for the login form to actually appear in DOM
-            logger.info("Waiting for login form...")
-            try:
-                page.wait_for_selector('input[name="email"]', timeout=30000)
-            except Exception:
-                # Try alternate selectors
-                logger.warning("email input not found by name, trying type=email...")
+            def is_cf_page():
                 try:
-                    page.wait_for_selector('input[type="email"]', timeout=15000)
-                    # Fill using type selector instead
-                    logger.info("Filling login form (via type selector)...")
-                    page.fill('input[type="email"]', IVASMS_EMAIL)
-                    time.sleep(0.5)
-                    page.fill('input[type="password"]', IVASMS_PASSWORD)
-                    time.sleep(0.5)
-                    page.click('button[type="submit"]')
-                    page.wait_for_load_state('networkidle', timeout=30000)
-                    time.sleep(2)
+                    content = page.content().lower()
+                    title = page.title().lower()
+                    return any(kw in content or kw in title for kw in cf_keywords)
+                except Exception:
+                    return False
+
+            def is_login_page():
+                try:
+                    return page.query_selector('input[name="email"]') is not None or \
+                           page.query_selector('input[type="email"]') is not None
+                except Exception:
+                    return False
+
+            def is_logged_in():
+                try:
+                    url = page.url
+                    return 'portal' in url or 'dashboard' in url
+                except Exception:
+                    return False
+
+            # Wait up to 60 seconds for CF to resolve
+            logger.info("⏳ Waiting for Cloudflare to resolve (up to 60s)...")
+            for i in range(60):
+                time.sleep(1)
+
+                if is_logged_in():
+                    logger.info("✅ Already logged in!")
                     cookies = page.context.cookies()
                     save_cookies(cookies)
                     last_login_time = time.time()
-                    logger.info(f"✅ Login done via fallback selector. URL: {page.url}")
-                    return cookies
-                except Exception as e2:
-                    logger.error(f"Fallback selector also failed: {e2}")
-                    # Save whatever cookies we have (may include CF clearance)
-                    cookies = page.context.cookies()
-                    if cookies:
-                        save_cookies(cookies)
                     return cookies
 
-            # Fill login form
-            logger.info("Filling login form...")
-            page.fill('input[name="email"]', IVASMS_EMAIL)
-            time.sleep(0.5)
-            page.fill('input[name="password"]', IVASMS_PASSWORD)
-            time.sleep(0.5)
+                if is_login_page():
+                    logger.info(f"✅ Login form found after {i+1}s!")
+                    break
 
-            # Click login button
-            page.click('button[type="submit"]')
-            page.wait_for_load_state('networkidle', timeout=30000)
-            time.sleep(2)
+                if i % 10 == 9:
+                    logger.info(f"Still waiting for CF... ({i+1}s elapsed) URL: {page.url}")
+                    # Try reloading after 20s and 40s if still on CF page
+                    if i in [19, 39] and is_cf_page():
+                        logger.info("🔄 Reloading page to retry CF bypass...")
+                        page.reload(wait_until='domcontentloaded', timeout=30000)
+                        time.sleep(3)
+            else:
+                logger.warning("⚠️ Timed out waiting for CF — attempting login anyway")
+
+            # Check final state
+            if is_logged_in():
+                cookies = page.context.cookies()
+                save_cookies(cookies)
+                last_login_time = time.time()
+                logger.info("✅ Already logged in after wait!")
+                return cookies
+
+            if not is_login_page():
+                logger.warning(f"Login form not found. Current URL: {page.url}")
+                logger.warning(f"Page title: {page.title()}")
+                # Save whatever cookies we have (CF clearance may still be useful)
+                cookies = page.context.cookies()
+                if cookies:
+                    logger.info(f"Saving {len(cookies)} cookies anyway (may include cf_clearance)")
+                    save_cookies(cookies)
+                return cookies
+
+            # Fill the login form
+            logger.info("📝 Filling login form...")
+            try:
+                email_sel = 'input[name="email"]' if page.query_selector('input[name="email"]') else 'input[type="email"]'
+                pass_sel  = 'input[name="password"]' if page.query_selector('input[name="password"]') else 'input[type="password"]'
+
+                page.click(email_sel)
+                time.sleep(0.3)
+                page.type(email_sel, IVASMS_EMAIL, delay=80)   # human-like typing
+                time.sleep(0.5)
+                page.click(pass_sel)
+                time.sleep(0.3)
+                page.type(pass_sel, IVASMS_PASSWORD, delay=80)
+                time.sleep(0.5)
+
+                page.click('button[type="submit"]')
+                page.wait_for_load_state('networkidle', timeout=30000)
+                time.sleep(3)
+
+            except Exception as e:
+                logger.error(f"Error filling form: {e}")
 
             current_url = page.url
             logger.info(f"After login URL: {current_url}")
@@ -320,9 +362,9 @@ def login_with_camoufox():
             last_login_time = time.time()
 
             if 'portal' in current_url or 'dashboard' in current_url:
-                logger.info(f"✅ Camoufox login successful! Got {len(cookies)} cookies")
+                logger.info(f"✅ Login successful! Got {len(cookies)} cookies")
             else:
-                logger.warning(f"Login may have failed, URL: {current_url}")
+                logger.warning(f"⚠️ Login may have failed. URL: {current_url}")
 
             return cookies
 
