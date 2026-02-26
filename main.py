@@ -235,22 +235,33 @@ def get_received_sms():
         return []
 
 
-def detect_country(phone):
-    """Detect country from phone number prefix"""
-    prefixes = {
-        '+1': '🇺🇸 USA', '+44': '🇬🇧 UK', '+234': '🇳🇬 Nigeria',
-        '+84': '🇻🇳 Vietnam', '+62': '🇮🇩 Indonesia', '+91': '🇮🇳 India',
-        '+55': '🇧🇷 Brazil', '+7': '🇷🇺 Russia', '+86': '🇨🇳 China',
-        '+81': '🇯🇵 Japan', '+49': '🇩🇪 Germany', '+33': '🇫🇷 France',
-        '+263': '🇿🇼 Zimbabwe', '+972': '🇮🇱 Israel', '+58': '🇻🇪 Venezuela',
-        '+60': '🇲🇾 Malaysia', '+880': '🇧🇩 Bangladesh', '+92': '🇵🇰 Pakistan',
-        '+20': '🇪🇬 Egypt', '+254': '🇰🇪 Kenya', '+27': '🇿🇦 South Africa',
-    }
-    for prefix, country in prefixes.items():
-        if phone.startswith(prefix):
-            return country
-    return '🌍 Unknown'
-
+def country_keyboard():
+    numbers = get_ivasms_numbers()
+    
+    # Extract unique range names (countries) from your numbers
+    ranges = {}
+    for row in numbers:
+        if len(row) >= 2:
+            number = row[0]
+            range_name = row[1]  # e.g "BENIN 761"
+            if range_name not in ranges:
+                ranges[range_name] = number
+    
+    keyboard = []
+    row = []
+    for range_name, number in list(ranges.items())[:20]:  # Max 20
+        row.append(InlineKeyboardButton(
+            f"📱 {range_name}",
+            callback_data=f"country_{range_name}"
+        ))
+        if len(row) == 2:
+            keyboard.append(row)
+            row = []
+    if row:
+        keyboard.append(row)
+    
+    keyboard.append([InlineKeyboardButton("🏠 Main Menu", callback_data="menu")])
+    return InlineKeyboardMarkup(keyboard)
 
 # ============================================================
 # MESSAGE FORMATTERS
@@ -371,42 +382,35 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             reply_markup=country_keyboard()
         )
 
-    elif data.startswith("country_"):
-        country = data.replace("country_", "")
-        user_sessions[user_id] = {'country': country, 'number': None}
+elif data.startswith("country_"):
+    range_name = data.replace("country_", "")
+    user_sessions[user_id] = {'country': range_name, 'number': None}
 
-        # Try to get a real number from IVASMS
-        numbers = get_ivasms_numbers()
-        assigned_number = None
+    numbers = get_ivasms_numbers()
+    assigned_number = None
+    for row in numbers:
+        if len(row) >= 2 and row[1] == range_name:
+            assigned_number = row[0]
+            break
 
-        for row in numbers:
-            row_text = ' '.join(row).lower()
-            if country.lower() in row_text:
-                for cell in row:
-                    if re.search(r'\+?\d{8,15}', cell):
-                        assigned_number = cell
-                        break
-            if assigned_number:
-                break
+    if not assigned_number:
+        assigned_number = "No number available"
 
-        if not assigned_number:
-            assigned_number = f"No number available for {country}"
+    user_sessions[user_id]['number'] = assigned_number
 
-        user_sessions[user_id]['number'] = assigned_number
-
-        await query.edit_message_text(
-            f"""🔄 <b>Number Assigned Successfully</b>
+    await query.edit_message_text(
+        f"""🔄 <b>Number Assigned Successfully</b>
 
 ━━━━━━━━━━━━━━━━━━━━
-🌍 <b>Country:</b> {country}
+🌍 <b>Range:</b> {range_name}
 📱 <b>Number:</b> <code>{assigned_number}</code>
 🟢 <b>Ready to receive OTP</b>
 ━━━━━━━━━━━━━━━━━━━━
 
-Use this number to receive OTPs. They will appear here automatically!""",
-            parse_mode='HTML',
-            reply_markup=number_assigned_keyboard()
-        )
+Use this number to receive OTPs!""",
+        parse_mode='HTML',
+        reply_markup=number_assigned_keyboard()
+    )
 
     elif data == "change_number":
         user_id_session = user_sessions.get(user_id, {})
