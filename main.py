@@ -382,24 +382,24 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             reply_markup=country_keyboard()
         )
 
-elif data.startswith("country_"):
-    range_name = data.replace("country_", "")
-    user_sessions[user_id] = {'country': range_name, 'number': None}
+    elif data.startswith("country_"):
+        range_name = data.replace("country_", "")
+        user_sessions[user_id] = {'country': range_name, 'number': None}
 
-    numbers = get_ivasms_numbers()
-    assigned_number = None
-    for row in numbers:
-        if len(row) >= 2 and row[1] == range_name:
-            assigned_number = row[0]
-            break
+        numbers = get_ivasms_numbers()
+        assigned_number = None
+        for row in numbers:
+            if len(row) >= 2 and row[1] == range_name:
+                assigned_number = row[0]
+                break
 
-    if not assigned_number:
-        assigned_number = "No number available"
+        if not assigned_number:
+            assigned_number = "No number available"
 
-    user_sessions[user_id]['number'] = assigned_number
+        user_sessions[user_id]['number'] = assigned_number
 
-    await query.edit_message_text(
-        f"""🔄 <b>Number Assigned Successfully</b>
+        await query.edit_message_text(
+            f"""🔄 <b>Number Assigned Successfully</b>
 
 ━━━━━━━━━━━━━━━━━━━━
 🌍 <b>Range:</b> {range_name}
@@ -408,28 +408,25 @@ elif data.startswith("country_"):
 ━━━━━━━━━━━━━━━━━━━━
 
 Use this number to receive OTPs!""",
-        parse_mode='HTML',
-        reply_markup=number_assigned_keyboard()
-    )
+            parse_mode='HTML',
+            reply_markup=number_assigned_keyboard()
+        )
 
     elif data == "change_number":
         user_id_session = user_sessions.get(user_id, {})
-        country = user_id_session.get('country', 'Unknown')
+        range_name = user_id_session.get('country', 'Unknown')
 
         numbers = get_ivasms_numbers()
+        current_number = user_id_session.get('number')
         assigned_number = None
+
         for row in numbers:
-            row_text = ' '.join(row).lower()
-            if country.lower() in row_text:
-                for cell in row:
-                    if re.search(r'\+?\d{8,15}', cell):
-                        assigned_number = cell
-                        break
-            if assigned_number:
+            if len(row) >= 2 and row[1] == range_name and row[0] != current_number:
+                assigned_number = row[0]
                 break
 
         if not assigned_number:
-            assigned_number = f"No other number available for {country}"
+            assigned_number = "No other number available"
 
         if user_id in user_sessions:
             user_sessions[user_id]['number'] = assigned_number
@@ -438,7 +435,7 @@ Use this number to receive OTPs!""",
             f"""🔄 <b>New Number Assigned!</b>
 
 ━━━━━━━━━━━━━━━━━━━━
-🌍 <b>Country:</b> {country}
+🌍 <b>Range:</b> {range_name}
 📱 <b>Number:</b> <code>{assigned_number}</code>
 🟢 <b>Ready to receive OTP</b>
 ━━━━━━━━━━━━━━━━━━━━""",
@@ -456,10 +453,10 @@ Use this number to receive OTPs!""",
                 reply_markup=main_menu_keyboard()
             )
             for msg in messages:
-                await send_otp_to_group(msg)
+                await send_otp_to_group_async(msg)
         else:
             await query.edit_message_text(
-                "📭 <b>No new OTPs found.</b>\n\nI check automatically every 60 seconds.",
+                "📭 <b>No new OTPs found.</b>\n\nI check automatically every 10 seconds.",
                 parse_mode='HTML',
                 reply_markup=main_menu_keyboard()
             )
@@ -485,7 +482,7 @@ Use this number to receive OTPs!""",
 ⏱ <b>Uptime:</b> {uptime_str}
 📨 <b>Total OTPs Sent:</b> {bot_stats['total_otps_sent']}
 🕐 <b>Last Check:</b> {bot_stats['last_check']}
-🔁 <b>Check Interval:</b> Every 60 seconds
+🔁 <b>Check Interval:</b> Every 10 seconds
 👥 <b>Active Users:</b> {len(user_sessions)}
 🟢 <b>Monitor Running:</b> {'Yes' if bot_stats['is_running'] else 'No'}"""
         await query.edit_message_text(stats_text, parse_mode='HTML', reply_markup=main_menu_keyboard())
@@ -511,8 +508,7 @@ Use this number to receive OTPs!""",
             parse_mode='HTML',
             reply_markup=main_menu_keyboard()
         )
-
-
+        
 # ============================================================
 # SEND OTP TO GROUP
 # ============================================================
