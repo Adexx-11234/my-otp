@@ -561,7 +561,7 @@ def background_monitor():
             else:
                 logger.info("No new OTPs found")
 
-            time.sleep(60)
+            time.sleep(10)
         except Exception as e:
             logger.error(f"Monitor error: {e}")
             bot_stats['last_error'] = str(e)
