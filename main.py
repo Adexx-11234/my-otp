@@ -56,19 +56,29 @@ def ivasms_login():
         ivasms_session = requests.Session()
         ivasms_session.headers.update({
             'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
-            'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
-            'Accept-Language': 'en-US,en;q=0.5',
+            'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8',
+            'Accept-Language': 'en-US,en;q=0.9',
+            'Accept-Encoding': 'gzip, deflate, br',
+            'Connection': 'keep-alive',
+            'Upgrade-Insecure-Requests': '1',
+            'Sec-Fetch-Dest': 'document',
+            'Sec-Fetch-Mode': 'navigate',
+            'Sec-Fetch-Site': 'none',
+            'Sec-Fetch-User': '?1',
+            'Cache-Control': 'max-age=0',
         })
 
         login_url = "https://www.ivasms.com/login"
         resp = ivasms_session.get(login_url, timeout=15)
+        logger.info(f"Login page status: {resp.status_code}")
+        
         soup = BeautifulSoup(resp.content, 'html.parser')
 
         csrf = None
         csrf_input = soup.find('input', {'name': '_token'})
         if csrf_input:
             csrf = csrf_input.get('value')
-            logger.info(f"✅ CSRF token found")
+            logger.info("✅ CSRF token found")
         else:
             logger.warning("⚠️ No CSRF token found")
 
@@ -76,23 +86,28 @@ def ivasms_login():
         if csrf:
             data['_token'] = csrf
 
-        login_resp = ivasms_session.post(login_url, data=data, timeout=15)
+        ivasms_session.headers.update({
+            'Content-Type': 'application/x-www-form-urlencoded',
+            'Origin': 'https://www.ivasms.com',
+            'Referer': 'https://www.ivasms.com/login',
+        })
+
+        login_resp = ivasms_session.post(login_url, data=data, timeout=15, allow_redirects=True)
         logger.info(f"Login response URL: {login_resp.url}")
         logger.info(f"Login response status: {login_resp.status_code}")
 
         if 'portal' in login_resp.url or 'dashboard' in login_resp.url:
             ivasms_logged_in = True
-            logger.info("✅ IVASMS login successful (URL redirect confirmed)")
+            logger.info("✅ IVASMS login successful")
             return True
 
         soup2 = BeautifulSoup(login_resp.content, 'html.parser')
         if soup2.find(string=re.compile(r'logout|dashboard|portal', re.I)):
             ivasms_logged_in = True
-            logger.info("✅ IVASMS login successful (page content confirmed)")
+            logger.info("✅ IVASMS login successful")
             return True
 
-        logger.warning(f"⚠️ Login failed - final URL was: {login_resp.url}")
-        logger.warning("Continuing anyway...")
+        logger.warning(f"⚠️ Login failed - URL: {login_resp.url} - Status: {login_resp.status_code}")
         ivasms_logged_in = True
         return True
 
