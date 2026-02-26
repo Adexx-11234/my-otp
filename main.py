@@ -68,32 +68,37 @@ def ivasms_login():
         csrf_input = soup.find('input', {'name': '_token'})
         if csrf_input:
             csrf = csrf_input.get('value')
+            logger.info(f"✅ CSRF token found")
+        else:
+            logger.warning("⚠️ No CSRF token found")
 
         data = {'email': IVASMS_EMAIL, 'password': IVASMS_PASSWORD}
         if csrf:
             data['_token'] = csrf
 
         login_resp = ivasms_session.post(login_url, data=data, timeout=15)
+        logger.info(f"Login response URL: {login_resp.url}")
+        logger.info(f"Login response status: {login_resp.status_code}")
 
         if 'portal' in login_resp.url or 'dashboard' in login_resp.url:
             ivasms_logged_in = True
-            logger.info("✅ IVASMS login successful")
+            logger.info("✅ IVASMS login successful (URL redirect confirmed)")
             return True
 
         soup2 = BeautifulSoup(login_resp.content, 'html.parser')
         if soup2.find(string=re.compile(r'logout|dashboard|portal', re.I)):
             ivasms_logged_in = True
-            logger.info("✅ IVASMS login successful")
+            logger.info("✅ IVASMS login successful (page content confirmed)")
             return True
 
-        logger.warning("⚠️ IVASMS login may have failed")
+        logger.warning(f"⚠️ Login failed - final URL was: {login_resp.url}")
+        logger.warning("Continuing anyway...")
         ivasms_logged_in = True
         return True
 
     except Exception as e:
         logger.error(f"IVASMS login error: {e}")
         return False
-
 
 def get_ivasms_numbers():
     global ivasms_session, ivasms_logged_in
