@@ -3,15 +3,16 @@ import asyncio
 import logging
 import re
 import requests
+import json
+import time
+import threading
+import pycountry
 from bs4 import BeautifulSoup
 from datetime import datetime
-from flask import Flask, jsonify, request
+from flask import Flask, jsonify
 from dotenv import load_dotenv
 from telegram import Bot, Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import Application, CommandHandler, CallbackQueryHandler, ContextTypes
-import threading
-import time
-import json
 
 load_dotenv()
 
@@ -23,12 +24,68 @@ logger = logging.getLogger(__name__)
 
 app = Flask(__name__)
 
+# ============================================================
+# CONFIG
+# ============================================================
+
 BOT_TOKEN = os.getenv('TELEGRAM_BOT_TOKEN')
 GROUP_ID = os.getenv('TELEGRAM_GROUP_ID')
 IVASMS_EMAIL = os.getenv('IVASMS_EMAIL')
 IVASMS_PASSWORD = os.getenv('IVASMS_PASSWORD')
 CHANNEL_LINK = os.getenv('CHANNEL_LINK', 'https://t.me/yourchannel')
 DEV_LINK = os.getenv('DEV_LINK', 'https://t.me/yourdev')
+
+# IVASMS proper AJAX endpoints
+LOGIN_URL = "https://www.ivasms.com/login"
+SMS_LIST_URL = "https://www.ivasms.com/portal/sms/received/getsms"
+SMS_NUMBERS_URL = "https://www.ivasms.com/portal/sms/received/getsms/number"
+SMS_DETAILS_URL = "https://www.ivasms.com/portal/sms/received/getsms/number/sms"
+NUMBERS_PAGE_URL = "https://www.ivasms.com/portal/numbers"
+
+SMS_HEADERS = {
+    "X-Requested-With": "XMLHttpRequest",
+    "Referer": "https://www.ivasms.com/portal/sms/received",
+    "Content-Type": "application/x-www-form-urlencoded; charset=UTF-8",
+    "Accept": "text/html, */*; q=0.01",
+    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+    "Accept-Encoding": "gzip, deflate"
+}
+
+SERVICE_PATTERNS = {
+    "WhatsApp": r"(whatsapp|wa\.me|verify|wassap|whtsapp)",
+    "Facebook": r"(facebook|fb\.me|fb\-|meta)",
+    "Telegram": r"(telegram|t\.me|tg|telegrambot)",
+    "Google": r"(google|gmail|goog|g\.co|accounts\.google)",
+    "Twitter": r"(twitter|x\.com|twtr)",
+    "Instagram": r"(instagram|insta|ig)",
+    "Apple": r"(apple|icloud|appleid)",
+    "Amazon": r"(amazon|amzn)",
+    "Microsoft": r"(microsoft|msft|outlook|hotmail)",
+    "PayPal": r"(paypal)",
+    "Netflix": r"(netflix)",
+    "Uber": r"(uber)",
+    "TikTok": r"(tiktok)",
+    "LinkedIn": r"(linkedin)",
+    "Spotify": r"(spotify)",
+    "Lalamove": r"(lalamove)",
+}
+
+COUNTRY_ALIASES = {
+    "Ivory": "Cote d'Ivoire",
+    "USA": "United States",
+    "UK": "United Kingdom",
+    "UAE": "United Arab Emirates",
+    "Benin": "Benin",
+    "Russia": "Russian Federation",
+    "China": "China",
+    "India": "India",
+    "Brazil": "Brazil",
+    "Nigeria": "Nigeria",
+    "Algeria": "Algeria",
+    "Madagascar": "Madagascar",
+}
+
+OTP_HISTORY_FILE = "otp_history.json"
 
 bot_stats = {
     'start_time': datetime.now(),
@@ -39,19 +96,107 @@ bot_stats = {
 }
 
 user_sessions = {}
-sent_otps = set()
-
 bot = None
 telegram_app = None
 ivasms_session = None
 ivasms_logged_in = False
+last_login_time = 0
+
 
 # ============================================================
-# IVASMS SCRAPER
+# COUNTRY / SERVICE HELPERS
+# ============================================================
+
+def get_flag_emoji(country_code):
+    if not country_code or len(country_code) != 2:
+        return "🌍"
+    code_points = [ord(c.upper()) - ord('A') + 0x1F1E6 for c in country_code]
+    return chr(code_points[0]) + chr(code_points[1])
+
+
+def get_country_emoji(country_name):
+    try:
+        name = COUNTRY_ALIASES.get(country_name, country_name)
+        countries = pycountry.countries.search_fuzzy(name)
+        if countries:
+            return get_flag_emoji(countries[0].alpha_2)
+    except Exception:
+        pass
+    return "🌍"
+
+
+def extract_country_from_range(range_name):
+    """Extract country name from IVASMS range e.g. 'BENIN 761' -> 'Benin'"""
+    if not range_name:
+        return "Unknown"
+    parts = range_name.strip().split()
+    if parts:
+        return parts[0].capitalize()
+    return "Unknown"
+
+
+def extract_service(message):
+    for service, pattern in SERVICE_PATTERNS.items():
+        if re.search(pattern, message, re.IGNORECASE):
+            return service
+    return "Unknown"
+
+
+def extract_otp(text):
+    match = re.search(r'\b(\d{4,8})\b', text)
+    return match.group(1) if match else None
+
+
+# ============================================================
+# OTP HISTORY (persistent deduplication)
+# ============================================================
+
+def load_otp_history():
+    try:
+        if os.path.exists(OTP_HISTORY_FILE):
+            with open(OTP_HISTORY_FILE, 'r') as f:
+                return json.load(f)
+    except Exception:
+        pass
+    return {}
+
+
+def save_otp_history(history):
+    try:
+        with open(OTP_HISTORY_FILE, 'w') as f:
+            json.dump(history, f, indent=2)
+    except Exception as e:
+        logger.error(f"Error saving OTP history: {e}")
+
+
+def is_otp_already_sent(msg_id, full_message):
+    history = load_otp_history()
+    if msg_id not in history:
+        return False
+    for entry in history[msg_id]:
+        if entry.get("full_message") == full_message:
+            return True
+    return False
+
+
+def mark_otp_sent(msg_id, otp, full_message):
+    history = load_otp_history()
+    if msg_id not in history:
+        history[msg_id] = []
+    history[msg_id].append({
+        "otp": otp,
+        "full_message": full_message,
+        "timestamp": datetime.now().isoformat()
+    })
+    save_otp_history(history)
+
+
+# ============================================================
+# IVASMS LOGIN
 # ============================================================
 
 def ivasms_login():
-    global ivasms_session, ivasms_logged_in
+    global ivasms_session, ivasms_logged_in, last_login_time
     try:
         ivasms_session = requests.Session()
         ivasms_session.headers.update({
@@ -60,50 +205,166 @@ def ivasms_login():
             'Accept-Language': 'en-US,en;q=0.5',
         })
 
-        # Set all cookies
+        # Load cookies from environment
         cookie_string = os.getenv('IVASMS_COOKIES', '')
-        for cookie in cookie_string.split(';'):
-            cookie = cookie.strip()
-            if '=' in cookie:
-                name, value = cookie.split('=', 1)
-                ivasms_session.cookies.set(name.strip(), value.strip(), domain='www.ivasms.com')
+        if cookie_string:
+            for cookie in cookie_string.split(';'):
+                cookie = cookie.strip()
+                if '=' in cookie:
+                    name, value = cookie.split('=', 1)
+                    ivasms_session.cookies.set(name.strip(), value.strip(), domain='www.ivasms.com')
 
-        # Set ivas_sms_session separately
-        ivasms_session.cookies.set(
-            'ivas_sms_session',
-            os.getenv('IVASMS_SESSION', ''),
-            domain='www.ivasms.com'
-        )
+        # Set ivas_sms_session (HttpOnly cookie not accessible via JS)
+        session_cookie = os.getenv('IVASMS_SESSION', '')
+        if session_cookie:
+            ivasms_session.cookies.set('ivas_sms_session', session_cookie, domain='www.ivasms.com')
 
-        logger.info("✅ Cookies loaded")
+        logger.info("Cookies loaded, testing session...")
 
-        # Test session
-        test = ivasms_session.get('https://www.ivasms.com/portal/numbers', timeout=15)
-        logger.info(f"Session test - URL: {test.url} Status: {test.status_code}")
-
-        if 'login' not in test.url and test.status_code == 200:
+        # Test cookie session
+        test = ivasms_session.get('https://www.ivasms.com/portal/sms/received', timeout=15)
+        if test.status_code == 200 and 'login' not in test.url:
             ivasms_logged_in = True
-            logger.info("✅ IVASMS session working!")
-        else:
-            logger.warning(f"⚠️ Session may have expired: {test.url}")
-            ivasms_logged_in = True
+            last_login_time = time.time()
+            logger.info("✅ IVASMS session working via cookies!")
+            return True
 
+        logger.warning(f"Cookie session returned {test.status_code}, trying password login...")
+
+        # Fall back to password login
+        resp = ivasms_session.get(LOGIN_URL, timeout=15)
+        soup = BeautifulSoup(resp.content, 'html.parser')
+        csrf_input = soup.find('input', {'name': '_token'})
+
+        if not csrf_input:
+            logger.warning("No CSRF token — continuing with cookies anyway")
+            ivasms_logged_in = True
+            return True
+
+        csrf = csrf_input.get('value')
+        login_data = {'_token': csrf, 'email': IVASMS_EMAIL, 'password': IVASMS_PASSWORD}
+
+        ivasms_session.headers.update({
+            'Content-Type': 'application/x-www-form-urlencoded',
+            'Origin': 'https://www.ivasms.com',
+            'Referer': 'https://www.ivasms.com/login',
+        })
+
+        login_resp = ivasms_session.post(LOGIN_URL, data=login_data, timeout=15, allow_redirects=True)
+        logger.info(f"Login: {login_resp.status_code} -> {login_resp.url}")
+
+        if 'portal' in login_resp.url or login_resp.status_code == 200:
+            ivasms_logged_in = True
+            last_login_time = time.time()
+            logger.info("✅ IVASMS login successful!")
+            return True
+
+        ivasms_logged_in = True
         return True
 
     except Exception as e:
         logger.error(f"IVASMS login error: {e}")
-        return False
-        
-def get_ivasms_numbers():
-    global ivasms_session, ivasms_logged_in
-    try:
-        if not ivasms_logged_in:
-            ivasms_login()
+        ivasms_logged_in = True
+        return True
 
-        url = "https://www.ivasms.com/portal/numbers"
-        resp = ivasms_session.get(url, timeout=15)
+
+def refresh_session_if_needed():
+    global last_login_time
+    if time.time() - last_login_time >= 1800:
+        logger.info("Refreshing IVASMS session...")
+        ivasms_login()
+
+
+# ============================================================
+# IVASMS DATA FETCHING (proper AJAX endpoints)
+# ============================================================
+
+def get_csrf_token():
+    try:
+        resp = ivasms_session.get('https://www.ivasms.com/portal/sms/received', timeout=15)
         soup = BeautifulSoup(resp.content, 'html.parser')
 
+        csrf = soup.find('meta', {'name': 'csrf-token'})
+        if csrf:
+            return csrf.get('content')
+
+        csrf_input = soup.find('input', {'name': '_token'})
+        if csrf_input:
+            return csrf_input.get('value')
+
+        from urllib.parse import unquote
+        xsrf = ivasms_session.cookies.get('XSRF-TOKEN', '')
+        if xsrf:
+            return unquote(xsrf)
+
+    except Exception as e:
+        logger.error(f"Error getting CSRF: {e}")
+    return None
+
+
+def fetch_sms_ranges(csrf):
+    """Fetch SMS ranges via AJAX"""
+    try:
+        headers = SMS_HEADERS.copy()
+        headers['X-CSRF-TOKEN'] = csrf
+        payload = f"_token={csrf}&from=&to="
+        resp = ivasms_session.post(SMS_LIST_URL, headers=headers, data=payload, timeout=30)
+        logger.info(f"SMS ranges response: {resp.status_code}")
+
+        if resp.status_code != 200:
+            return []
+
+        soup = BeautifulSoup(resp.text, 'html.parser')
+        items = soup.find_all('div', class_='item')
+        ranges = []
+        for item in items:
+            range_div = item.find('div', class_='col-sm-4')
+            if range_div:
+                ranges.append(range_div.text.strip())
+
+        logger.info(f"Found ranges: {ranges}")
+        return ranges
+
+    except Exception as e:
+        logger.error(f"Error fetching ranges: {e}")
+        return []
+
+
+def fetch_numbers_for_range(range_name, csrf):
+    """Fetch phone numbers for a range via AJAX"""
+    try:
+        headers = SMS_HEADERS.copy()
+        headers['X-CSRF-TOKEN'] = csrf
+        payload = f"_token={csrf}&start=&end=&range={range_name}"
+        resp = ivasms_session.post(SMS_NUMBERS_URL, headers=headers, data=payload, timeout=30)
+        soup = BeautifulSoup(resp.text, 'html.parser')
+        number_divs = soup.find_all('div', class_='col-sm-4')
+        return [div.text.strip() for div in number_divs if div.text.strip()]
+    except Exception as e:
+        logger.error(f"Error fetching numbers for {range_name}: {e}")
+        return []
+
+
+def fetch_sms_for_number(number, range_name, csrf):
+    """Fetch SMS messages for a specific number via AJAX"""
+    try:
+        headers = SMS_HEADERS.copy()
+        headers['X-CSRF-TOKEN'] = csrf
+        payload = f"_token={csrf}&start=&end=&Number={number}&Range={range_name}"
+        resp = ivasms_session.post(SMS_DETAILS_URL, headers=headers, data=payload, timeout=30)
+        soup = BeautifulSoup(resp.text, 'html.parser')
+        message_divs = soup.select('div.col-9.col-sm-6 p.mb-0.pb-0')
+        return [div.text.strip() for div in message_divs] if message_divs else []
+    except Exception as e:
+        logger.error(f"Error fetching SMS for {number}: {e}")
+        return []
+
+
+def get_ivasms_numbers():
+    """Get numbers list from portal/numbers for the Get Number feature"""
+    try:
+        resp = ivasms_session.get(NUMBERS_PAGE_URL, timeout=15)
+        soup = BeautifulSoup(resp.content, 'html.parser')
         numbers = []
         tables = soup.find_all('table')
         for table in tables:
@@ -113,134 +374,72 @@ def get_ivasms_numbers():
                 if cells:
                     row_data = [c.get_text(strip=True) for c in cells]
                     numbers.append(row_data)
-
         return numbers
     except Exception as e:
-        logger.error(f"Error fetching numbers: {e}")
+        logger.error(f"Error fetching numbers page: {e}")
         return []
 
 
 def get_received_sms():
-    global ivasms_session, ivasms_logged_in
+    """Main function to get all new OTPs"""
+    messages = []
     try:
-        if not ivasms_logged_in:
-            ivasms_login()
+        refresh_session_if_needed()
+        csrf = get_csrf_token()
+        if not csrf:
+            logger.warning("Could not get CSRF token")
+            return []
 
-        url = "https://www.ivasms.com/portal/sms/received"
-        resp = ivasms_session.get(url, timeout=15)
+        ranges = fetch_sms_ranges(csrf)
+        if not ranges:
+            logger.info("No SMS ranges found")
+            return []
 
-        if resp.status_code == 401 or 'login' in resp.url:
-            ivasms_login()
-            resp = ivasms_session.get(url, timeout=15)
+        for range_name in ranges:
+            try:
+                numbers = fetch_numbers_for_range(range_name, csrf)
+                country_name = extract_country_from_range(range_name)
+                country_emoji = get_country_emoji(country_name)
 
-        soup = BeautifulSoup(resp.content, 'html.parser')
-        messages = []
+                for number in numbers:
+                    try:
+                        sms_list = fetch_sms_for_number(number, range_name, csrf)
+                        for sms_text in sms_list:
+                            otp = extract_otp(sms_text)
+                            if not otp:
+                                continue
 
-        tables = soup.find_all('table')
-        for table in tables:
-            rows = table.find_all('tr')[1:]
-            for row in rows:
-                cells = row.find_all('td')
-                if len(cells) >= 3:
-                    texts = [c.get_text(strip=True) for c in cells]
-                    phone = ''
-                    service = ''
-                    message = ''
-                    timestamp = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+                            service = extract_service(sms_text)
+                            msg_id = f"{number}_{otp}_{sms_text[:30]}"
 
-                    for t in texts:
-                        if re.search(r'\+?\d{8,15}', t):
-                            phone = t
-                        elif re.search(r'\d{4}:\d{2}|\d{2}/\d{2}', t):
-                            timestamp = t
-                        elif len(t) > 15:
-                            message = t
+                            if is_otp_already_sent(msg_id, sms_text):
+                                continue
 
-                    otp_match = re.search(r'\b(\d{4,8})\b', message)
-                    if otp_match:
-                        otp = otp_match.group(1)
-                        for svc in ['WhatsApp', 'Facebook', 'Instagram', 'Twitter', 'Telegram', 'Google', 'TikTok', 'Discord']:
-                            if svc.lower() in message.lower():
-                                service = svc
-                                break
-                        if not service:
-                            service = 'Unknown'
-
-                        msg_id = f"{phone}_{otp}_{timestamp}"
-                        if msg_id not in sent_otps:
                             messages.append({
                                 'id': msg_id,
-                                'phone': phone or 'Unknown',
+                                'phone': number,
                                 'otp': otp,
                                 'service': service,
-                                'message': message,
-                                'timestamp': timestamp,
-                                'country': detect_country(phone)
+                                'message': sms_text,
+                                'timestamp': datetime.now().strftime('%Y-%m-%d %H:%M:%S'),
+                                'country': f"{country_emoji} {country_name}",
+                                'range': range_name,
                             })
 
-        try:
-            live_url = "https://www.ivasms.com/portal/live/my_sms"
-            live_resp = ivasms_session.get(live_url, timeout=15)
-            live_soup = BeautifulSoup(live_resp.content, 'html.parser')
-            live_tables = live_soup.find_all('table')
-            for table in live_tables:
-                rows = table.find_all('tr')[1:]
-                for row in rows:
-                    cells = row.find_all('td')
-                    if len(cells) >= 3:
-                        texts = [c.get_text(strip=True) for c in cells]
-                        phone = ''
-                        message = ''
-                        timestamp = datetime.now().strftime('%H:%M:%S')
-                        for t in texts:
-                            if re.search(r'\+?\d{8,15}', t):
-                                phone = t
-                            elif len(t) > 15:
-                                message = t
-                        otp_match = re.search(r'\b(\d{4,8})\b', message)
-                        if otp_match:
-                            otp = otp_match.group(1)
-                            service = 'Unknown'
-                            for svc in ['WhatsApp', 'Facebook', 'Instagram', 'Twitter', 'Telegram', 'Google', 'TikTok']:
-                                if svc.lower() in message.lower():
-                                    service = svc
-                                    break
-                            msg_id = f"{phone}_{otp}_{timestamp}"
-                            if msg_id not in sent_otps:
-                                messages.append({
-                                    'id': msg_id,
-                                    'phone': phone or 'Unknown',
-                                    'otp': otp,
-                                    'service': service,
-                                    'message': message,
-                                    'timestamp': timestamp,
-                                    'country': detect_country(phone)
-                                })
-        except:
-            pass
+                        time.sleep(0.3)
 
-        return messages
+                    except Exception as e:
+                        logger.error(f"Error processing number {number}: {e}")
+                        continue
+
+            except Exception as e:
+                logger.error(f"Error processing range {range_name}: {e}")
+                continue
 
     except Exception as e:
-        logger.error(f"Error fetching SMS: {e}")
-        return []
+        logger.error(f"Error in get_received_sms: {e}")
 
-
-def detect_country(phone):
-    """Get country from IVASMS numbers list by matching phone number"""
-    try:
-        numbers = get_ivasms_numbers()
-        for row in numbers:
-            if len(row) >= 2:
-                number = row[0]
-                range_name = row[1]  # e.g "BENIN 761"
-                if phone and number and phone.replace('+', '').replace(' ', '') in number.replace('+', '').replace(' ', ''):
-                    # Extract just the country name from range name (remove the number at end)
-                    country_name = ' '.join(range_name.split()[:-1])  # "BENIN 761" → "BENIN"
-                    return country_name.title()  # "Benin"
-    except:
-        pass
-    return '🌍 Unknown'
+    return messages
 
 
 # ============================================================
@@ -271,8 +470,10 @@ def country_keyboard():
     keyboard = []
     row = []
     for range_name, number in list(ranges.items())[:20]:
+        country = extract_country_from_range(range_name)
+        emoji = get_country_emoji(country)
         row.append(InlineKeyboardButton(
-            f"📱 {range_name}",
+            f"{emoji} {range_name}",
             callback_data=f"country_{range_name}"
         ))
         if len(row) == 2:
@@ -345,9 +546,9 @@ def format_otp_message(data):
 # ============================================================
 
 async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    welcome = """🏠 <b>Welcome to OTP Bot!</b>
+    welcome = """🏠 <b>Welcome to NEXUSBOT!</b>
 
-I monitor IVASMS for new OTPs and forward them to your group instantly.
+I monitor IVASMS for new OTPs and forward them instantly.
 
 Use the menu below to get started:"""
     await update.message.reply_text(welcome, parse_mode='HTML', reply_markup=main_menu_keyboard())
@@ -368,7 +569,7 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     elif data == "get_number" or data == "change_country":
         await query.edit_message_text(
-            "🌍 <b>Select Country:</b>\n\nChoose a country to get a virtual number:",
+            "🌍 <b>Select Country:</b>\n\nLoading your IVASMS numbers...",
             parse_mode='HTML',
             reply_markup=country_keyboard()
         )
@@ -388,12 +589,14 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             assigned_number = "No number available"
 
         user_sessions[user_id]['number'] = assigned_number
+        country = extract_country_from_range(range_name)
+        emoji = get_country_emoji(country)
 
         await query.edit_message_text(
             f"""🔄 <b>Number Assigned Successfully</b>
 
 ━━━━━━━━━━━━━━━━━━━━
-🌍 <b>Range:</b> {range_name}
+{emoji} <b>Range:</b> {range_name}
 📱 <b>Number:</b> <code>{assigned_number}</code>
 🟢 <b>Ready to receive OTP</b>
 ━━━━━━━━━━━━━━━━━━━━
@@ -421,11 +624,14 @@ Use this number to receive OTPs!""",
         if user_id in user_sessions:
             user_sessions[user_id]['number'] = assigned_number
 
+        country = extract_country_from_range(range_name)
+        emoji = get_country_emoji(country)
+
         await query.edit_message_text(
             f"""🔄 <b>New Number Assigned!</b>
 
 ━━━━━━━━━━━━━━━━━━━━
-🌍 <b>Range:</b> {range_name}
+{emoji} <b>Range:</b> {range_name}
 📱 <b>Number:</b> <code>{assigned_number}</code>
 🟢 <b>Ready to receive OTP</b>
 ━━━━━━━━━━━━━━━━━━━━""",
@@ -454,7 +660,7 @@ Use this number to receive OTPs!""",
     elif data == "status":
         uptime = datetime.now() - bot_stats['start_time']
         uptime_str = str(uptime).split('.')[0]
-        status_text = f"""📊 <b>Bot Status</b>
+        status_text = f"""📊 <b>NEXUSBOT Status</b>
 
 ⏱ <b>Uptime:</b> {uptime_str}
 📨 <b>OTPs Sent:</b> {bot_stats['total_otps_sent']}
@@ -479,10 +685,10 @@ Use this number to receive OTPs!""",
 
     elif data == "test":
         test_data = {
-            'phone': '+8493***2484',
+            'phone': '+22901440499',
             'otp': '840113',
             'service': 'WhatsApp',
-            'country': '🇻🇳 Vietnam',
+            'country': '🇧🇯 Benin',
             'timestamp': datetime.now().strftime('%Y-%m-%d %H:%M:%S'),
             'message': 'Your WhatsApp code is 840-113. Do not share it.'
         }
@@ -513,11 +719,11 @@ async def send_otp_to_group_async(data):
             parse_mode='HTML',
             reply_markup=otp_buttons()
         )
-        sent_otps.add(data['id'])
+        mark_otp_sent(data['id'], data['otp'], data['message'])
         bot_stats['total_otps_sent'] += 1
-        logger.info(f"✅ OTP sent: {data['otp']} for {data['service']}")
+        logger.info(f"✅ OTP sent: {data['otp']} | {data['service']} | {data['country']}")
     except Exception as e:
-        logger.error(f"Failed to send OTP to group: {e}")
+        logger.error(f"Failed to send OTP: {e}")
 
 
 def send_otp_to_group(data):
@@ -556,7 +762,7 @@ def background_monitor():
         except Exception as e:
             logger.error(f"Monitor error: {e}")
             bot_stats['last_error'] = str(e)
-            time.sleep(120)
+            time.sleep(30)
 
 
 def start_telegram_bot():
@@ -584,11 +790,13 @@ def home():
     uptime = datetime.now() - bot_stats['start_time']
     return jsonify({
         'status': 'running',
+        'bot': 'NEXUSBOT',
         'uptime': str(uptime).split('.')[0],
         'total_otps_sent': bot_stats['total_otps_sent'],
         'last_check': bot_stats['last_check'],
         'monitor_running': bot_stats['is_running']
     })
+
 
 @app.route('/check')
 def manual_check():
@@ -597,9 +805,17 @@ def manual_check():
         send_otp_to_group(msg)
     return jsonify({'status': 'success', 'found': len(messages)})
 
+
 @app.route('/status')
 def status():
-    return jsonify(bot_stats)
+    uptime = datetime.now() - bot_stats['start_time']
+    return jsonify({
+        'uptime': str(uptime).split('.')[0],
+        'total_otps_sent': bot_stats['total_otps_sent'],
+        'last_check': bot_stats['last_check'],
+        'is_running': bot_stats['is_running'],
+        'last_error': bot_stats['last_error']
+    })
 
 
 # ============================================================
@@ -609,10 +825,10 @@ def status():
 def main():
     global bot, telegram_app
 
-    logger.info("🚀 Starting OTP Bot...")
+    logger.info("🚀 Starting NEXUSBOT...")
 
-    if not all([BOT_TOKEN, GROUP_ID, IVASMS_EMAIL, IVASMS_PASSWORD]):
-        logger.error("❌ Missing environment variables!")
+    if not all([BOT_TOKEN, GROUP_ID]):
+        logger.error("❌ Missing BOT_TOKEN or GROUP_ID!")
         return
 
     ivasms_login()
@@ -624,7 +840,6 @@ def main():
     telegram_app.add_handler(CallbackQueryHandler(button_handler))
 
     logger.info("✅ Bot initialized")
-
     start_telegram_bot()
 
     def send_startup():
@@ -635,7 +850,7 @@ def main():
             async def send():
                 await bot.send_message(
                     chat_id=GROUP_ID,
-                    text="🚀 <b>OTP Bot Started!</b>\n\n✅ IVASMS connected\n✅ Monitoring every 10 seconds\n✅ Ready to forward OTPs",
+                    text="🚀 <b>NEXUSBOT Started!</b>\n\n✅ IVASMS connected\n✅ Monitoring every 10 seconds\n✅ Ready to forward OTPs",
                     parse_mode='HTML',
                     reply_markup=otp_buttons()
                 )
