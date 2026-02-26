@@ -56,65 +56,44 @@ def ivasms_login():
         ivasms_session = requests.Session()
         ivasms_session.headers.update({
             'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
-            'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8',
-            'Accept-Language': 'en-US,en;q=0.9',
-            'Accept-Encoding': 'gzip, deflate, br',
-            'Connection': 'keep-alive',
-            'Upgrade-Insecure-Requests': '1',
-            'Sec-Fetch-Dest': 'document',
-            'Sec-Fetch-Mode': 'navigate',
-            'Sec-Fetch-Site': 'none',
-            'Sec-Fetch-User': '?1',
-            'Cache-Control': 'max-age=0',
+            'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
+            'Accept-Language': 'en-US,en;q=0.5',
         })
 
-        login_url = "https://www.ivasms.com/login"
-        resp = ivasms_session.get(login_url, timeout=15)
-        logger.info(f"Login page status: {resp.status_code}")
-        
-        soup = BeautifulSoup(resp.content, 'html.parser')
+        # Set all cookies
+        cookie_string = os.getenv('IVASMS_COOKIES', '')
+        for cookie in cookie_string.split(';'):
+            cookie = cookie.strip()
+            if '=' in cookie:
+                name, value = cookie.split('=', 1)
+                ivasms_session.cookies.set(name.strip(), value.strip(), domain='www.ivasms.com')
 
-        csrf = None
-        csrf_input = soup.find('input', {'name': '_token'})
-        if csrf_input:
-            csrf = csrf_input.get('value')
-            logger.info("✅ CSRF token found")
+        # Set ivas_sms_session separately
+        ivasms_session.cookies.set(
+            'ivas_sms_session',
+            os.getenv('IVASMS_SESSION', ''),
+            domain='www.ivasms.com'
+        )
+
+        logger.info("✅ Cookies loaded")
+
+        # Test session
+        test = ivasms_session.get('https://www.ivasms.com/portal/numbers', timeout=15)
+        logger.info(f"Session test - URL: {test.url} Status: {test.status_code}")
+
+        if 'login' not in test.url and test.status_code == 200:
+            ivasms_logged_in = True
+            logger.info("✅ IVASMS session working!")
         else:
-            logger.warning("⚠️ No CSRF token found")
-
-        data = {'email': IVASMS_EMAIL, 'password': IVASMS_PASSWORD}
-        if csrf:
-            data['_token'] = csrf
-
-        ivasms_session.headers.update({
-            'Content-Type': 'application/x-www-form-urlencoded',
-            'Origin': 'https://www.ivasms.com',
-            'Referer': 'https://www.ivasms.com/login',
-        })
-
-        login_resp = ivasms_session.post(login_url, data=data, timeout=15, allow_redirects=True)
-        logger.info(f"Login response URL: {login_resp.url}")
-        logger.info(f"Login response status: {login_resp.status_code}")
-
-        if 'portal' in login_resp.url or 'dashboard' in login_resp.url:
+            logger.warning(f"⚠️ Session may have expired: {test.url}")
             ivasms_logged_in = True
-            logger.info("✅ IVASMS login successful")
-            return True
 
-        soup2 = BeautifulSoup(login_resp.content, 'html.parser')
-        if soup2.find(string=re.compile(r'logout|dashboard|portal', re.I)):
-            ivasms_logged_in = True
-            logger.info("✅ IVASMS login successful")
-            return True
-
-        logger.warning(f"⚠️ Login failed - URL: {login_resp.url} - Status: {login_resp.status_code}")
-        ivasms_logged_in = True
         return True
 
     except Exception as e:
         logger.error(f"IVASMS login error: {e}")
         return False
-
+        
 def get_ivasms_numbers():
     global ivasms_session, ivasms_logged_in
     try:
