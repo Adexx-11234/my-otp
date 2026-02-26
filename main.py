@@ -321,7 +321,24 @@ def _selenium_login():
         options.add_argument("--disable-dev-shm-usage")
         options.add_argument("--disable-gpu")
         options.add_argument("--headless=new")
+        options.add_argument("--window-size=1920,1080")
         options.add_argument(f"--user-agent={BASE_HEADERS['User-Agent']}")
+
+        # Find Chrome binary — check common Render/Linux locations
+        import shutil
+        chrome_binary = (
+            shutil.which("google-chrome") or
+            shutil.which("google-chrome-stable") or
+            shutil.which("chromium-browser") or
+            shutil.which("chromium") or
+            "/usr/bin/google-chrome" or
+            "/usr/bin/chromium-browser"
+        )
+        if chrome_binary:
+            logger.info(f"Found Chrome at: {chrome_binary}")
+            options.binary_location = chrome_binary
+        else:
+            logger.warning("Chrome binary not found in PATH — letting uc find it")
 
         driver = uc.Chrome(options=options, version_main=None)
         logger.info("✅ Chrome driver started")
@@ -334,8 +351,21 @@ def _selenium_login():
         driver.get(LOGIN_URL)
         time.sleep(random.uniform(3, 5))
 
-        # Wait for form
-        WebDriverWait(driver, 20).until(EC.presence_of_element_located((By.NAME, "email")))
+        # Wait for CF to clear and form to appear (up to 40s)
+        logger.info("⏳ Waiting for login form...")
+        for i in range(40):
+            try:
+                el = driver.find_element(By.NAME, "email")
+                if el:
+                    logger.info(f"✅ Login form found after {i+1}s")
+                    break
+            except Exception:
+                pass
+            time.sleep(1)
+        else:
+            logger.error("❌ Login form never appeared (CF still blocking)")
+            bot_stats['session_valid'] = False
+            return False
 
         # Type email
         email_input = driver.find_element(By.NAME, "email")
@@ -365,13 +395,16 @@ def _selenium_login():
             bot_stats['session_valid'] = False
             return False
 
-        # Extract cookies from Selenium and put into requests session
+        # Extract cookies into requests session
         selenium_cookies = driver.get_cookies()
         session = requests.Session()
         session.headers.update({'User-Agent': BASE_HEADERS['User-Agent']})
         for cookie in selenium_cookies:
-            session.cookies.set(cookie['name'], cookie['value'], domain=cookie.get('domain', 'www.ivasms.com'))
-
+            session.cookies.set(
+                cookie['name'],
+                cookie['value'],
+                domain=cookie.get('domain', 'www.ivasms.com')
+            )
         logger.info(f"✅ Extracted {len(selenium_cookies)} cookies from Selenium")
 
         # Get CSRF from portal
@@ -398,6 +431,7 @@ def _selenium_login():
                 driver.quit()
             except Exception:
                 pass
+
 
 def refresh_session_if_needed():
     global last_login_time
