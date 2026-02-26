@@ -13,6 +13,7 @@ from flask import Flask, jsonify
 from dotenv import load_dotenv
 from telegram import Bot, Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import Application, CommandHandler, CallbackQueryHandler, ContextTypes
+from camoufox.sync_api import Camoufox
 
 load_dotenv()
 
@@ -35,7 +36,6 @@ IVASMS_PASSWORD = os.getenv('IVASMS_PASSWORD')
 CHANNEL_LINK = os.getenv('CHANNEL_LINK', 'https://t.me/yourchannel')
 DEV_LINK = os.getenv('DEV_LINK', 'https://t.me/yourdev')
 
-# IVASMS proper AJAX endpoints
 LOGIN_URL = "https://www.ivasms.com/login"
 SMS_LIST_URL = "https://www.ivasms.com/portal/sms/received/getsms"
 SMS_NUMBERS_URL = "https://www.ivasms.com/portal/sms/received/getsms/number"
@@ -86,6 +86,7 @@ COUNTRY_ALIASES = {
 }
 
 OTP_HISTORY_FILE = "otp_history.json"
+COOKIES_FILE = "ivasms_cookies.json"
 
 bot_stats = {
     'start_time': datetime.now(),
@@ -126,7 +127,6 @@ def get_country_emoji(country_name):
 
 
 def extract_country_from_range(range_name):
-    """Extract country name from IVASMS range e.g. 'BENIN 761' -> 'Benin'"""
     if not range_name:
         return "Unknown"
     parts = range_name.strip().split()
@@ -148,7 +148,7 @@ def extract_otp(text):
 
 
 # ============================================================
-# OTP HISTORY (persistent deduplication)
+# OTP HISTORY
 # ============================================================
 
 def load_otp_history():
@@ -192,91 +192,168 @@ def mark_otp_sent(msg_id, otp, full_message):
 
 
 # ============================================================
-# IVASMS LOGIN
+# COOKIE MANAGEMENT
+# ============================================================
+
+def save_cookies(cookies):
+    try:
+        with open(COOKIES_FILE, 'w') as f:
+            json.dump(cookies, f)
+        logger.info(f"✅ Saved {len(cookies)} cookies")
+    except Exception as e:
+        logger.error(f"Error saving cookies: {e}")
+
+
+def load_cookies():
+    try:
+        if os.path.exists(COOKIES_FILE):
+            with open(COOKIES_FILE, 'r') as f:
+                return json.load(f)
+    except Exception:
+        pass
+    return []
+
+
+def apply_cookies_to_session(session, cookies):
+    for cookie in cookies:
+        try:
+            session.cookies.set(
+                cookie['name'],
+                cookie['value'],
+                domain=cookie.get('domain', 'www.ivasms.com')
+            )
+        except Exception:
+            pass
+
+
+# ============================================================
+# CAMOUFOX LOGIN (bypasses Cloudflare)
+# ============================================================
+
+def login_with_camoufox():
+    """Use Camoufox to bypass Cloudflare and login to IVASMS"""
+    global last_login_time
+    logger.info("🦊 Starting Camoufox browser to bypass Cloudflare...")
+    try:
+        with Camoufox(headless=True, os='windows') as browser:
+            page = browser.new_page()
+
+            # Go to login page
+            logger.info("Navigating to IVASMS login...")
+            page.goto(LOGIN_URL, wait_until='networkidle', timeout=60000)
+            time.sleep(2)
+
+            # Check if we got past Cloudflare
+            if 'login' not in page.url and 'portal' in page.url:
+                logger.info("Already logged in!")
+                cookies = page.context.cookies()
+                save_cookies(cookies)
+                last_login_time = time.time()
+                return cookies
+
+            # Fill login form
+            logger.info("Filling login form...")
+            page.fill('input[name="email"]', IVASMS_EMAIL)
+            time.sleep(0.5)
+            page.fill('input[name="password"]', IVASMS_PASSWORD)
+            time.sleep(0.5)
+
+            # Click login button
+            page.click('button[type="submit"]')
+            page.wait_for_load_state('networkidle', timeout=30000)
+            time.sleep(2)
+
+            current_url = page.url
+            logger.info(f"After login URL: {current_url}")
+
+            if 'portal' in current_url or 'dashboard' in current_url:
+                cookies = page.context.cookies()
+                save_cookies(cookies)
+                last_login_time = time.time()
+                logger.info(f"✅ Camoufox login successful! Got {len(cookies)} cookies")
+                return cookies
+            else:
+                logger.warning(f"Login may have failed, URL: {current_url}")
+                cookies = page.context.cookies()
+                save_cookies(cookies)
+                last_login_time = time.time()
+                return cookies
+
+    except Exception as e:
+        logger.error(f"Camoufox login error: {e}")
+        return []
+
+
+# ============================================================
+# IVASMS SESSION SETUP
 # ============================================================
 
 def ivasms_login():
     global ivasms_session, ivasms_logged_in, last_login_time
-    try:
-        ivasms_session = requests.Session()
-        ivasms_session.headers.update({
+
+    # First try saved cookies
+    saved_cookies = load_cookies()
+    if saved_cookies:
+        logger.info(f"Found {len(saved_cookies)} saved cookies, testing...")
+        session = requests.Session()
+        session.headers.update({
             'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
-            'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
-            'Accept-Language': 'en-US,en;q=0.5',
         })
+        apply_cookies_to_session(session, saved_cookies)
 
-        # Load cookies from environment
-        cookie_string = os.getenv('IVASMS_COOKIES', '')
-        if cookie_string:
-            for cookie in cookie_string.split(';'):
-                cookie = cookie.strip()
-                if '=' in cookie:
-                    name, value = cookie.split('=', 1)
-                    ivasms_session.cookies.set(name.strip(), value.strip(), domain='www.ivasms.com')
+        try:
+            test = session.get('https://www.ivasms.com/portal/sms/received', timeout=15)
+            if test.status_code == 200 and 'login' not in test.url:
+                ivasms_session = session
+                ivasms_logged_in = True
+                logger.info("✅ Saved cookies still valid!")
+                return True
+            logger.info("Saved cookies expired, getting fresh ones...")
+        except Exception as e:
+            logger.error(f"Cookie test error: {e}")
 
-        # Set ivas_sms_session (HttpOnly cookie not accessible via JS)
-        session_cookie = os.getenv('IVASMS_SESSION', '')
-        if session_cookie:
-            ivasms_session.cookies.set('ivas_sms_session', session_cookie, domain='www.ivasms.com')
+    # Login fresh with Camoufox
+    cookies = login_with_camoufox()
+    if not cookies:
+        logger.error("Failed to get cookies from Camoufox")
+        ivasms_logged_in = True
+        return False
 
-        logger.info("Cookies loaded, testing session...")
+    # Create requests session with fresh cookies
+    ivasms_session = requests.Session()
+    ivasms_session.headers.update({
+        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+    })
+    apply_cookies_to_session(ivasms_session, cookies)
 
-        # Test cookie session
+    # Test the session
+    try:
         test = ivasms_session.get('https://www.ivasms.com/portal/sms/received', timeout=15)
+        logger.info(f"Session test: {test.status_code} -> {test.url}")
         if test.status_code == 200 and 'login' not in test.url:
             ivasms_logged_in = True
-            last_login_time = time.time()
-            logger.info("✅ IVASMS session working via cookies!")
+            logger.info("✅ IVASMS session working!")
             return True
-
-        logger.warning(f"Cookie session returned {test.status_code}, trying password login...")
-
-        # Fall back to password login
-        resp = ivasms_session.get(LOGIN_URL, timeout=15)
-        soup = BeautifulSoup(resp.content, 'html.parser')
-        csrf_input = soup.find('input', {'name': '_token'})
-
-        if not csrf_input:
-            logger.warning("No CSRF token — continuing with cookies anyway")
+        else:
+            logger.warning("Session test failed — will retry on next check")
             ivasms_logged_in = True
             return True
-
-        csrf = csrf_input.get('value')
-        login_data = {'_token': csrf, 'email': IVASMS_EMAIL, 'password': IVASMS_PASSWORD}
-
-        ivasms_session.headers.update({
-            'Content-Type': 'application/x-www-form-urlencoded',
-            'Origin': 'https://www.ivasms.com',
-            'Referer': 'https://www.ivasms.com/login',
-        })
-
-        login_resp = ivasms_session.post(LOGIN_URL, data=login_data, timeout=15, allow_redirects=True)
-        logger.info(f"Login: {login_resp.status_code} -> {login_resp.url}")
-
-        if 'portal' in login_resp.url or login_resp.status_code == 200:
-            ivasms_logged_in = True
-            last_login_time = time.time()
-            logger.info("✅ IVASMS login successful!")
-            return True
-
-        ivasms_logged_in = True
-        return True
-
     except Exception as e:
-        logger.error(f"IVASMS login error: {e}")
+        logger.error(f"Session test error: {e}")
         ivasms_logged_in = True
         return True
 
 
 def refresh_session_if_needed():
     global last_login_time
-    if time.time() - last_login_time >= 1800:
-        logger.info("Refreshing IVASMS session...")
+    # Refresh every 25 minutes
+    if time.time() - last_login_time >= 1500:
+        logger.info("Refreshing IVASMS session with Camoufox...")
         ivasms_login()
 
 
 # ============================================================
-# IVASMS DATA FETCHING (proper AJAX endpoints)
+# IVASMS DATA FETCHING
 # ============================================================
 
 def get_csrf_token():
@@ -303,7 +380,6 @@ def get_csrf_token():
 
 
 def fetch_sms_ranges(csrf):
-    """Fetch SMS ranges via AJAX"""
     try:
         headers = SMS_HEADERS.copy()
         headers['X-CSRF-TOKEN'] = csrf
@@ -331,7 +407,6 @@ def fetch_sms_ranges(csrf):
 
 
 def fetch_numbers_for_range(range_name, csrf):
-    """Fetch phone numbers for a range via AJAX"""
     try:
         headers = SMS_HEADERS.copy()
         headers['X-CSRF-TOKEN'] = csrf
@@ -346,7 +421,6 @@ def fetch_numbers_for_range(range_name, csrf):
 
 
 def fetch_sms_for_number(number, range_name, csrf):
-    """Fetch SMS messages for a specific number via AJAX"""
     try:
         headers = SMS_HEADERS.copy()
         headers['X-CSRF-TOKEN'] = csrf
@@ -361,7 +435,6 @@ def fetch_sms_for_number(number, range_name, csrf):
 
 
 def get_ivasms_numbers():
-    """Get numbers list from portal/numbers for the Get Number feature"""
     try:
         resp = ivasms_session.get(NUMBERS_PAGE_URL, timeout=15)
         soup = BeautifulSoup(resp.content, 'html.parser')
@@ -381,14 +454,16 @@ def get_ivasms_numbers():
 
 
 def get_received_sms():
-    """Main function to get all new OTPs"""
     messages = []
     try:
         refresh_session_if_needed()
         csrf = get_csrf_token()
         if not csrf:
-            logger.warning("Could not get CSRF token")
-            return []
+            logger.warning("Could not get CSRF token — session may have expired")
+            ivasms_login()
+            csrf = get_csrf_token()
+            if not csrf:
+                return []
 
         ranges = fetch_sms_ranges(csrf)
         if not ranges:
@@ -818,6 +893,13 @@ def status():
     })
 
 
+@app.route('/relogin')
+def relogin():
+    """Force fresh login with Camoufox"""
+    threading.Thread(target=ivasms_login, daemon=True).start()
+    return jsonify({'status': 'Relogin started'})
+
+
 # ============================================================
 # MAIN
 # ============================================================
@@ -831,6 +913,7 @@ def main():
         logger.error("❌ Missing BOT_TOKEN or GROUP_ID!")
         return
 
+    # Login with Camoufox
     ivasms_login()
 
     bot = Bot(token=BOT_TOKEN)
@@ -850,7 +933,7 @@ def main():
             async def send():
                 await bot.send_message(
                     chat_id=GROUP_ID,
-                    text="🚀 <b>NEXUSBOT Started!</b>\n\n✅ IVASMS connected\n✅ Monitoring every 10 seconds\n✅ Ready to forward OTPs",
+                    text="🚀 <b>NEXUSBOT Started!</b>\n\n✅ Cloudflare bypassed\n✅ IVASMS connected\n✅ Monitoring every 10 seconds\n✅ Ready to forward OTPs",
                     parse_mode='HTML',
                     reply_markup=otp_buttons()
                 )
