@@ -231,116 +231,98 @@ def apply_cookies_to_session(session, cookies):
 # ============================================================
 
 def login_with_camoufox():
-    """Use Camoufox to bypass Cloudflare and login to IVASMS"""
-    global last_login_time
-    logger.info("🦊 Starting Camoufox browser to bypass Cloudflare...")
-    try:
-        with Camoufox(
-            headless=True,
-            os='windows',
-            # Mimic a real screen size
-            screen={'width': 1920, 'height': 1080},
-            # Enable WebGL and other features real browsers have
-            args=['--disable-blink-features=AutomationControlled'],
-        ) as browser:
-            context = browser.new_context(
-                viewport={'width': 1920, 'height': 1080},
-                locale='en-US',
-                timezone_id='America/New_York',
-            )
-            page = context.new_page()
+    """
+    Run Camoufox in a completely separate thread with its own event loop
+    so it never conflicts with the asyncio loop used by python-telegram-bot.
+    """
+    import concurrent.futures
 
-            # Mask automation signals
-            page.add_init_script("""
-                Object.defineProperty(navigator, 'webdriver', { get: () => undefined });
-                Object.defineProperty(navigator, 'plugins', { get: () => [1, 2, 3, 4, 5] });
-                Object.defineProperty(navigator, 'languages', { get: () => ['en-US', 'en'] });
-                window.chrome = { runtime: {} };
-            """)
+    def _do_login():
+        """This runs in a clean thread — no asyncio conflict."""
+        global last_login_time
+        logger.info("🦊 Starting Camoufox browser to bypass Cloudflare...")
+        try:
+            from camoufox.sync_api import Camoufox as CamoufoxSync
 
-            logger.info("Navigating to IVASMS login...")
-            page.goto(LOGIN_URL, wait_until='domcontentloaded', timeout=90000)
+            with CamoufoxSync(headless=True, os='windows') as browser:
+                page = browser.new_page()
 
-            # Initial wait for CF to start resolving
-            time.sleep(5)
+                logger.info("Navigating to IVASMS login...")
+                page.goto(LOGIN_URL, wait_until='domcontentloaded', timeout=90000)
+                time.sleep(5)
 
-            cf_keywords = ['checking your browser', 'just a moment', 'cloudflare', 'ddos-guard', 'please wait']
+                cf_keywords = ['checking your browser', 'just a moment', 'cloudflare', 'please wait']
 
-            def is_cf_page():
-                try:
-                    content = page.content().lower()
-                    title = page.title().lower()
-                    return any(kw in content or kw in title for kw in cf_keywords)
-                except Exception:
-                    return False
+                def is_cf_page():
+                    try:
+                        content = page.content().lower()
+                        title = page.title().lower()
+                        return any(kw in content or kw in title for kw in cf_keywords)
+                    except Exception:
+                        return False
 
-            def is_login_page():
-                try:
-                    return page.query_selector('input[name="email"]') is not None or \
-                           page.query_selector('input[type="email"]') is not None
-                except Exception:
-                    return False
+                def is_login_ready():
+                    try:
+                        return (
+                            page.query_selector('input[name="email"]') is not None or
+                            page.query_selector('input[type="email"]') is not None
+                        )
+                    except Exception:
+                        return False
 
-            def is_logged_in():
-                try:
-                    url = page.url
-                    return 'portal' in url or 'dashboard' in url
-                except Exception:
-                    return False
+                def is_logged_in():
+                    try:
+                        url = page.url
+                        return 'portal' in url or 'dashboard' in url
+                    except Exception:
+                        return False
 
-            # Wait up to 60 seconds for CF to resolve
-            logger.info("⏳ Waiting for Cloudflare to resolve (up to 60s)...")
-            for i in range(60):
-                time.sleep(1)
+                # Wait up to 60s for CF to clear
+                logger.info("⏳ Waiting for Cloudflare to resolve (up to 60s)...")
+                for i in range(60):
+                    time.sleep(1)
+                    if is_logged_in():
+                        logger.info("✅ Already logged in!")
+                        cookies = page.context.cookies()
+                        save_cookies(cookies)
+                        last_login_time = time.time()
+                        return cookies
+                    if is_login_ready():
+                        logger.info(f"✅ Login form found after {i+1}s!")
+                        break
+                    if i in [19, 39] and is_cf_page():
+                        logger.info("🔄 Reloading to retry CF bypass...")
+                        try:
+                            page.reload(wait_until='domcontentloaded', timeout=30000)
+                            time.sleep(3)
+                        except Exception:
+                            pass
+                    if i % 10 == 9:
+                        logger.info(f"Still waiting... ({i+1}s) | URL: {page.url}")
+                else:
+                    logger.warning("⚠️ Timed out waiting for CF — trying login anyway")
 
                 if is_logged_in():
-                    logger.info("✅ Already logged in!")
                     cookies = page.context.cookies()
                     save_cookies(cookies)
                     last_login_time = time.time()
                     return cookies
 
-                if is_login_page():
-                    logger.info(f"✅ Login form found after {i+1}s!")
-                    break
+                if not is_login_ready():
+                    logger.warning(f"Login form not found. URL: {page.url} | Title: {page.title()}")
+                    cookies = page.context.cookies()
+                    if cookies:
+                        save_cookies(cookies)
+                    return cookies
 
-                if i % 10 == 9:
-                    logger.info(f"Still waiting for CF... ({i+1}s elapsed) URL: {page.url}")
-                    # Try reloading after 20s and 40s if still on CF page
-                    if i in [19, 39] and is_cf_page():
-                        logger.info("🔄 Reloading page to retry CF bypass...")
-                        page.reload(wait_until='domcontentloaded', timeout=30000)
-                        time.sleep(3)
-            else:
-                logger.warning("⚠️ Timed out waiting for CF — attempting login anyway")
-
-            # Check final state
-            if is_logged_in():
-                cookies = page.context.cookies()
-                save_cookies(cookies)
-                last_login_time = time.time()
-                logger.info("✅ Already logged in after wait!")
-                return cookies
-
-            if not is_login_page():
-                logger.warning(f"Login form not found. Current URL: {page.url}")
-                logger.warning(f"Page title: {page.title()}")
-                # Save whatever cookies we have (CF clearance may still be useful)
-                cookies = page.context.cookies()
-                if cookies:
-                    logger.info(f"Saving {len(cookies)} cookies anyway (may include cf_clearance)")
-                    save_cookies(cookies)
-                return cookies
-
-            # Fill the login form
-            logger.info("📝 Filling login form...")
-            try:
+                # Fill the login form with human-like typing
+                logger.info("📝 Filling login form...")
                 email_sel = 'input[name="email"]' if page.query_selector('input[name="email"]') else 'input[type="email"]'
                 pass_sel  = 'input[name="password"]' if page.query_selector('input[name="password"]') else 'input[type="password"]'
 
                 page.click(email_sel)
                 time.sleep(0.3)
-                page.type(email_sel, IVASMS_EMAIL, delay=80)   # human-like typing
+                page.type(email_sel, IVASMS_EMAIL, delay=80)
                 time.sleep(0.5)
                 page.click(pass_sel)
                 time.sleep(0.3)
@@ -351,27 +333,35 @@ def login_with_camoufox():
                 page.wait_for_load_state('networkidle', timeout=30000)
                 time.sleep(3)
 
-            except Exception as e:
-                logger.error(f"Error filling form: {e}")
+                current_url = page.url
+                cookies = page.context.cookies()
+                save_cookies(cookies)
+                last_login_time = time.time()
 
-            current_url = page.url
-            logger.info(f"After login URL: {current_url}")
+                if 'portal' in current_url or 'dashboard' in current_url:
+                    logger.info(f"✅ Login successful! Got {len(cookies)} cookies")
+                else:
+                    logger.warning(f"⚠️ Login may have failed. URL: {current_url}")
 
-            cookies = page.context.cookies()
-            save_cookies(cookies)
-            last_login_time = time.time()
+                return cookies
 
-            if 'portal' in current_url or 'dashboard' in current_url:
-                logger.info(f"✅ Login successful! Got {len(cookies)} cookies")
-            else:
-                logger.warning(f"⚠️ Login may have failed. URL: {current_url}")
+        except Exception as e:
+            logger.error(f"Camoufox login error: {e}")
+            return []
 
-            return cookies
+    # Run in a dedicated thread with its own loop — completely isolated from asyncio
+    with concurrent.futures.ThreadPoolExecutor(max_workers=1) as executor:
+        future = executor.submit(_do_login)
+        try:
+            return future.result(timeout=180)  # 3 min max
+        except concurrent.futures.TimeoutError:
+            logger.error("Camoufox login timed out after 180s")
+            return []
+        except Exception as e:
+            logger.error(f"Camoufox thread error: {e}")
+            return []
 
-    except Exception as e:
-        logger.error(f"Camoufox login error: {e}")
-        return []
-        
+
 # ============================================================
 # IVASMS SESSION SETUP
 # ============================================================
